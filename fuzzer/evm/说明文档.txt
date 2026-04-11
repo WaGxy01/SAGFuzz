@@ -1,0 +1,10 @@
+上述都是以太坊硬分叉升级对应的不同区块高度，其中Homestead是1150000.block，Byzantium是4370000.block，Petersburg是7280000.block，Istanbul是9069000，berlin是12244000，london是12965000，shanghai是17034870，fusaka是18200000.block
+fetch_block_advanced.py是获取区块信息的py脚本，用法：
+# 1. 安装依赖
+pip install web3 --break-system-packages
+
+# 2. 获取区块 18200000 (推荐使用增强版)
+python fetch_block_advanced.py --block 18200000 --output 18200000.block
+
+# 3. 验证文件
+python -c "import pickle; b=pickle.load(open('18200000.block','rb')); print(f'区块 {b[\"number\"]}, 交易数: {len(b[\"transactions\"])}')"
