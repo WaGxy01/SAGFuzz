@@ -93,6 +93,7 @@ def compile(solc_version, evm_version, source_code_file):
                                 "evm.bytecode.object",
                                 "evm.legacyAssembly",
                             ],
+                        "":["ast"]
                     }
                 }
             }

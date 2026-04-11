@@ -41,3 +41,5 @@ RPC_PORT = 8545
 REMOTE_FUZZING = False
 # True = Environmental instrumentation enabled, False = Environmental instrumentation disabled
 ENVIRONMENTAL_INSTRUMENTATION = True
+FITNESS_ALPHA = 1.0
+FITNESS_BETA  = 1.0

@@ -28,16 +28,61 @@ class ExecutionTraceAnalyzer(OnTheFlyAnalysis):
         self.env = fuzzing_environment
         self.symbolic_execution_count = 0
 
-
     def setup(self, ng, engine):
-            from static_analysis.path import PathAnalyzer
-            analyzer = PathAnalyzer(self.env.runtime_bytecode)
-            static_deps = analyzer.analyze()
-            for func_sig, dep in static_deps.items():
-                if func_sig not in self.env.data_dependencies:
-                    self.env.data_dependencies[func_sig] = {"read": set(), "write": set()}
-                self.env.data_dependencies[func_sig]["read"].update(dep["read"])
-            self.logger.info("[Static] Injected %d entries into data_dependencies", len(static_deps))
+        from static_analysis.path import PathAnalyzer
+        analyzer = PathAnalyzer(self.env.runtime_bytecode)
+        static_deps = analyzer.analyze()
+        for func_sig, dep in static_deps.items():
+            if func_sig not in self.env.data_dependencies:
+                self.env.data_dependencies[func_sig] = {"read": set(), "write": set()}
+            self.env.data_dependencies[func_sig]["read"].update(dep["read"])
+        self.logger.info("[Static] Injected %d entries into data_dependencies", len(static_deps))
+
+        # 生成静态调用链 + 注入初始种群
+        self.env.static_sequences = {}
+        if self.env.compiler_output and self.env.source_file:
+            try:
+                from static_analysis.invocation_sequence import InvocationSequenceGenerator
+                from engine.components import Individual
+
+                # 取 AST
+                ast_json = None
+                source_data = self.env.compiler_output.get('sources', {})
+                for key, val in source_data.items():
+                    if 'ast' in val:
+                        ast_json = val['ast']
+                        break
+                    elif 'AST' in val:
+                        ast_json = val['AST']
+                        break
+
+                if ast_json:
+                    gen = InvocationSequenceGenerator(
+                        bytecode=self.env.runtime_bytecode,
+                        ast_json=ast_json
+                    )
+
+                    # 生成静态序列供 f_seq 使用
+                    self.env.static_sequences = gen.generate_sequences()
+                    self.logger.info("[Static] Generated %d static sequences", len(self.env.static_sequences))
+
+                    # 注入初始种群
+                    chromosomes = gen.to_chromosomes(
+                        interface=self.env.interface,
+                        contract=self.env.population.indv_generator.contract,
+                        accounts=self.env.population.indv_generator.accounts,
+                        generator=self.env.population.indv_generator
+                    )
+                    for chrom in chromosomes.values():
+                        indv = Individual(generator=self.env.population.indv_generator).init(chromosome=chrom)
+                        engine.population.individuals.append(indv)
+                    self.logger.info("[Static] Injected %d individuals into population", len(chromosomes))
+                else:
+                    self.logger.warning("[Static] No AST found, skipping sequence generation")
+
+            except Exception as e:
+                self.logger.warning("[Static] Failed to generate sequences: %s", e)
+
 
     def execute(self, population, engine):
         if not hasattr(self, '_attack_simulator'):
