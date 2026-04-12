@@ -189,34 +189,155 @@ class PathAnalyzer:
         """检查块是否包含 SHA3/KECCAK256"""
         return any(ins.name in ('SHA3', 'KECCAK256') for ins in bb.ins)
 
+    def _has_caller(self, bb) -> bool:
+        """检查块是否包含 CALLER 指令"""
+        return any(ins.name == 'CALLER' for ins in bb.ins)
+
+    def _get_first_push_value(self, bb) -> Optional[int]:
+        """从基本块入口起，返回第一个 PUSH 指令的操作数值"""
+        for ins in bb.ins:
+            if ins.name == 'PUSH0':
+                return 0
+            if ins.name.startswith('PUSH') and len(ins.name) > 4 and ins.arg is not None:
+                return int.from_bytes(ins.arg, byteorder='big')
+        return None
+
+    def _normalize_mapping_address_slot(self, bb) -> Optional[int]:
+        """
+        mapping(address => T) 归一化：
+        含 KECCAK256 + CALLER 时，slot(k) = keccak256(k || p)，
+        从块入口第一个 PUSH 操作数取静态槽号 p。
+        """
+        return self._get_first_push_value(bb)
+
+    def _normalize_dynamic_array_struct_slot(self, bb) -> Optional[int]:
+        """
+        动态数组 / 值类型为 struct 的 mapping 归一化：
+        含 KECCAK256 但无 CALLER 时：
+          1. 若第二条指令是 PUSH1 或 DUP1，找第一个 MSTORE 后的 PUSH1 操作数
+          2. 否则取块入口第一个 PUSH 操作数
+        """
+        ins_list = bb.ins
+        if len(ins_list) < 2:
+            return self._get_first_push_value(bb)
+
+        second_ins = ins_list[1]
+        if second_ins.name in ('PUSH1', 'DUP1'):
+            for idx, ins in enumerate(ins_list):
+                if ins.name == 'MSTORE' and idx + 1 < len(ins_list):
+                    next_ins = ins_list[idx + 1]
+                    if next_ins.name.startswith('PUSH') and len(next_ins.name) > 4 and next_ins.arg is not None:
+                        return int.from_bytes(next_ins.arg, byteorder='big')
+            return self._get_first_push_value(bb)
+        else:
+            return self._get_first_push_value(bb)
+
+    def _match_sload_pattern(self, ins_list: list, sload_idx: int) -> Optional[int]:
+        """
+        对某个 SLOAD 指令向前做模式匹配，提取存储槽号。
+        仅用于无 SHA3 块中栈模拟失败时的兜底。
+
+        支持的模式（从短到长匹配）：
+        ① uint/int      : PUSH → SLOAD                              槽号 = PUSH 操作数
+        ② bool/address  : PUSH → PUSH → SWAP1 → SLOAD              槽号 = 第1个 PUSH 操作数
+        ③ enum 模式1    : PUSH → DUP1 → SLOAD                      槽号 = PUSH 操作数
+        ④ enum 模式2    : PUSH→PUSH→DUP1→PUSH2→EXP→DUP2→SLOAD     槽号 = 第2个 PUSH 操作数
+        ⑤ 定长数组模式1 : PUSH → DUP1 → DUP1 → SLOAD               槽号 = PUSH 操作数
+        ⑥ 定长数组模式2 : PUSH→DUP2→SWAP1→DUP1→PUSH→DUP2→SLOAD    槽号 = 第1个 PUSH 操作数
+        """
+        def push_val(ins) -> Optional[int]:
+            if ins.name == 'PUSH0':
+                return 0
+            if ins.name.startswith('PUSH') and len(ins.name) > 4 and ins.arg is not None:
+                return int.from_bytes(ins.arg, byteorder='big')
+            return None
+
+        def is_push(ins) -> bool:
+            return ins.name == 'PUSH0' or (ins.name.startswith('PUSH') and len(ins.name) > 4)
+
+        def before(n) -> Optional[list]:
+            if sload_idx < n:
+                return None
+            return ins_list[sload_idx - n: sload_idx]
+
+        # ① uint/int
+        pre = before(1)
+        if pre and is_push(pre[0]):
+            v = push_val(pre[0])
+            if v is not None:
+                return v
+        # ② bool/address
+        pre = before(3)
+        if pre and is_push(pre[0]) and is_push(pre[1]) and pre[2].name == 'SWAP1':
+            v = push_val(pre[0])
+            if v is not None:
+                return v
+        # ③ enum 模式1
+        pre = before(2)
+        if pre and is_push(pre[0]) and pre[1].name == 'DUP1':
+            v = push_val(pre[0])
+            if v is not None:
+                return v
+        # ④ enum 模式2
+        pre = before(6)
+        if pre and is_push(pre[0]) and is_push(pre[1]) and pre[2].name == 'DUP1' \
+                and pre[3].name.startswith('PUSH') and pre[4].name == 'EXP' and pre[5].name == 'DUP2':
+            v = push_val(pre[1])
+            if v is not None:
+                return v
+        # ⑤ 定长数组模式1
+        pre = before(3)
+        if pre and is_push(pre[0]) and pre[1].name == 'DUP1' and pre[2].name == 'DUP1':
+            v = push_val(pre[0])
+            if v is not None:
+                return v
+        # ⑥ 定长数组模式2
+        pre = before(6)
+        if pre and is_push(pre[0]) and pre[1].name == 'DUP2' and pre[2].name == 'SWAP1' \
+                and pre[3].name == 'DUP1' and is_push(pre[4]) and pre[5].name == 'DUP2':
+            v = push_val(pre[0])
+            if v is not None:
+                return v
+        return None
+
     def _simulate_for_sload(self, bb) -> Set[int]:
         """
-        模拟执行基本块，提取 SLOAD 的存储槽号
+        从基本块中提取 SLOAD 的存储槽号。
 
-        如果块中存在 SHA3，则放弃该 SLOAD，继续查找
-
-        Args:
-            bb: 基本块
-
-        Returns:
-            存储槽号集合
+        按块类型分三路处理：
+        ① 含 KECCAK256 + CALLER  → mapping(address=>T)，取块入口第一个 PUSH 操作数
+        ② 含 KECCAK256，无 CALLER → 动态数组/struct mapping，按 MSTORE 后 PUSH1 规则提取
+        ③ 无 KECCAK256            → 栈模拟为主，失败时用模式匹配兜底
         """
-        # 如果存在 SHA3，放弃这个块
-        if self._has_sha3(bb):
-            return set()
+        has_sha3   = self._has_sha3(bb)
+        has_caller = self._has_caller(bb)
 
+        # ① mapping(address=>T)
+        if has_sha3 and has_caller:
+            slot = self._normalize_mapping_address_slot(bb)
+            return {slot} if slot is not None else set()
+
+        # ② 动态数组 / struct mapping
+        if has_sha3 and not has_caller:
+            slot = self._normalize_dynamic_array_struct_slot(bb)
+            return {slot} if slot is not None else set()
+
+        # ③ 无 SHA3：栈模拟为主，失败时模式匹配兜底
         slots = set()
         stack = []
+        ins_list = bb.ins
 
-        for ins in bb.ins:
+        for idx, ins in enumerate(ins_list):
             op = ins.op
             name = ins.name
 
             if name == 'SLOAD':
-                # SLOAD 从栈顶取存储槽号
                 if stack and isinstance(stack[-1], int):
                     slots.add(stack[-1])
-                # 栈操作：弹1压1
+                else:
+                    fallback = self._match_sload_pattern(ins_list, idx)
+                    if fallback is not None:
+                        slots.add(fallback)
                 if stack:
                     stack.pop()
                 stack.append('SLOAD_VAL')
@@ -350,7 +471,11 @@ class PathAnalyzer:
 
     def _extract_sload_slots(self, path: List) -> Set[int]:
         """
-        从路径中提取所有 SLOAD 存储槽
+        从路径中提取所有 SLOAD 存储槽。
+
+        含 SHA3 的块不再跳过，交由 _simulate_for_sload 按类型归一化：
+          - 含 CALLER → mapping(address=>T)，归一化为静态槽号 p
+          - 不含 CALLER → 动态数组/struct mapping，按 MSTORE 后 PUSH1 规则提取
 
         Args:
             path: 基本块路径
@@ -361,17 +486,9 @@ class PathAnalyzer:
         all_slots = set()
 
         for bb in path:
-            # 检查是否有 SLOAD
             if not any(ins.name == 'SLOAD' for ins in bb.ins):
                 continue
-
-            # 如果有 SHA3 则跳过该块
-            if self._has_sha3(bb):
-                continue
-
-            # 模拟执行获取槽号
-            slots = self._simulate_for_sload(bb)
-            all_slots.update(slots)
+            all_slots.update(self._simulate_for_sload(bb))
 
         return all_slots
 

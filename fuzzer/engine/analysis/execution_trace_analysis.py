@@ -19,6 +19,7 @@ from z3 import simplify, BitVec, BitVecVal, Not, Optimize, sat, unsat, unknown, 
 from z3.z3util import get_vars
 
 from utils import settings
+from static_analysis.ast_analysis import get_variable_slot_mapping
 # === 新增 ===
 from detectors.reentrancy_attack_simulator import ReentrancyAttackSimulator
 
@@ -30,6 +31,8 @@ class ExecutionTraceAnalyzer(OnTheFlyAnalysis):
 
     def setup(self, ng, engine):
         from static_analysis.path import PathAnalyzer
+        from static_analysis.ast_analysis import analyze_ast, extract_prerequisite_writes
+
         analyzer = PathAnalyzer(self.env.runtime_bytecode)
         static_deps = analyzer.analyze()
         for func_sig, dep in static_deps.items():
@@ -38,15 +41,17 @@ class ExecutionTraceAnalyzer(OnTheFlyAnalysis):
             self.env.data_dependencies[func_sig]["read"].update(dep["read"])
         self.logger.info("[Static] Injected %d entries into data_dependencies", len(static_deps))
 
-        # 生成静态调用链 + 注入初始种群
         self.env.static_sequences = {}
-        if self.env.compiler_output and self.env.source_file:
-            try:
-                from static_analysis.invocation_sequence import InvocationSequenceGenerator
-                from engine.components import Individual
 
-                # 取 AST
-                ast_json = None
+        try:
+            from static_analysis.invocation_sequence import InvocationSequenceGenerator
+            from engine.components import Individual
+            import solcx
+
+            ast_json = None
+
+            # 方法1：compiler_output 已有就直接用
+            if self.env.compiler_output:
                 source_data = self.env.compiler_output.get('sources', {})
                 for key, val in source_data.items():
                     if 'ast' in val:
@@ -56,32 +61,94 @@ class ExecutionTraceAnalyzer(OnTheFlyAnalysis):
                         ast_json = val['AST']
                         break
 
-                if ast_json:
-                    gen = InvocationSequenceGenerator(
-                        bytecode=self.env.runtime_bytecode,
-                        ast_json=ast_json
-                    )
+            # 方法2：用 args.source 重新编译
+            if ast_json is None and getattr(self.env.args, 'source', None):
+                source_file = self.env.args.source
+                solc_version = self.env.args.solc_version
+                self.logger.info("[Static] Compiling %s with solc %s for AST", source_file, solc_version)
+                solcx.install_solc(solc_version)
+                solcx.set_solc_version(solc_version)
 
-                    # 生成静态序列供 f_seq 使用
-                    self.env.static_sequences = gen.generate_sequences()
-                    self.logger.info("[Static] Generated %d static sequences", len(self.env.static_sequences))
+                with open(source_file, 'r') as f:
+                    source_code = f.read()
 
-                    # 注入初始种群
-                    chromosomes = gen.to_chromosomes(
-                        interface=self.env.interface,
-                        contract=self.env.population.indv_generator.contract,
-                        accounts=self.env.population.indv_generator.accounts,
-                        generator=self.env.population.indv_generator
-                    )
-                    for chrom in chromosomes.values():
-                        indv = Individual(generator=self.env.population.indv_generator).init(chromosome=chrom)
-                        engine.population.individuals.append(indv)
-                    self.logger.info("[Static] Injected %d individuals into population", len(chromosomes))
-                else:
-                    self.logger.warning("[Static] No AST found, skipping sequence generation")
+                import os
+                source_name = os.path.basename(source_file)
 
-            except Exception as e:
-                self.logger.warning("[Static] Failed to generate sequences: %s", e)
+                standard_input = {
+                    "language": "Solidity",
+                    "sources": {
+                        source_name: {
+                            "content": source_code
+                        }
+                    },
+                    "settings": {
+                        "outputSelection": {
+                            "*": {
+                                "": ["ast"]
+                            }
+                        }
+                    }
+                }
+
+                compiled = solcx.compile_standard(standard_input, solc_version=solc_version)
+                # standard output 格式: {"sources": {"filename": {"ast": {...}}}}
+                sources = compiled.get('sources', {})
+                for fname, fdata in sources.items():
+                    if 'ast' in fdata:
+                        ast_json = fdata['ast']
+                        self.logger.info("[Static] Got AST from standard output: %s", fname)
+                        break
+
+            if ast_json:
+                self.logger.info("[Static] ast_json nodeType=%s, keys=%s",
+                                 ast_json.get('nodeType', 'N/A'),
+                                 list(ast_json.keys())[:5])
+                gen = InvocationSequenceGenerator(
+                    bytecode=self.env.runtime_bytecode,
+                    ast_json=ast_json
+                )
+                self.logger.info("[Static] ast_rw_info: %s", gen.ast_rw_info)
+
+                self.env.static_sequences = gen.generate_sequences()
+                self.logger.info("[Static] Generated %d static sequences", len(self.env.static_sequences))
+                self.logger.info("[Static] sequences: %s", self.env.static_sequences)
+
+                ast_rw = analyze_ast(ast_json)
+                var_slot_map = get_variable_slot_mapping(ast_json)
+                self.logger.info("[Static] variable->slot mapping: %s", var_slot_map)
+
+                prereq_writes = extract_prerequisite_writes(self.env.static_sequences, ast_rw)
+                for func_sig, dep in prereq_writes.items():
+                    if func_sig not in self.env.data_dependencies:
+                        self.env.data_dependencies[func_sig] = {"read": set(), "write": set()}
+                    # 把变量名转成 slot 编号
+                    for var_name in dep["write"]:
+                        if isinstance(var_name, int):
+                            self.env.data_dependencies[func_sig]["write"].add(var_name)
+                        elif var_name in var_slot_map:
+                            self.env.data_dependencies[func_sig]["write"].add(var_slot_map[var_name])
+                        else:
+                            self.logger.warning("[Static] variable '%s' not found in slot mapping", var_name)
+
+                chromosomes = gen.to_chromosomes(
+                    interface=self.env.interface,
+                    contract=self.env.population.indv_generator.contract,
+                    accounts=self.env.population.indv_generator.accounts,
+                    generator=self.env.population.indv_generator
+                )
+                for chrom in chromosomes.values():
+                    indv = Individual(generator=self.env.population.indv_generator).init(chromosome=chrom)
+                    engine.population.individuals.append(indv)
+                self.logger.info("[Static] Injected %d individuals into population", len(chromosomes))
+            else:
+                self.logger.warning("[Static] No AST found, skipping sequence generation")
+
+        except Exception as e:
+            import traceback
+            self.logger.warning("[Static] Failed: %s", e)
+            self.logger.warning("[Static] Traceback: %s", traceback.format_exc())
+
 
 
     def execute(self, population, engine):
@@ -140,6 +207,18 @@ class ExecutionTraceAnalyzer(OnTheFlyAnalysis):
             branch_coverage_percentage, branch_coverage, len(self.env.overall_jumpis) * 2, self.env.nr_of_transactions, len(self.env.unique_individuals),
             time.time() - self.env.execution_begin)
         self.logger.title(msg)
+
+        from utils.utils import get_function_signature_mapping
+        _sig_map = get_function_signature_mapping(self.env.abi)
+
+        self.logger.info("[DataDep] Generation %d - data_dependencies (%d entries):", g + 1,
+                         len(self.env.data_dependencies))
+        for func_sig, dep in self.env.data_dependencies.items():
+            func_name = _sig_map.get(func_sig, func_sig)  # 有映射就显示函数名，否则显示 hash
+            self.logger.info("  [%s] %s => read: %s, write: %s",
+                             func_name, func_sig,
+                             dep.get("read", set()),
+                             dep.get("write", set()))
 
         # Save to results
         if "generations" not in self.env.results:
