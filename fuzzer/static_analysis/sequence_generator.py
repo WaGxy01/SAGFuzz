@@ -93,33 +93,28 @@ class SequenceGenerator:
         Returns:
             {函数签名: {前置函数集合}}
         """
-        if self._dependency_graph is not None:
-            return self._dependency_graph
-
         all_functions = set(self.ast_rw_info.keys())
-        graph = defaultdict(set)
-
+        
         for func in all_functions:
-            info = self.ast_rw_info.get(func, {})
+            info = self.ast_rw_info.get(func, {"reads": [], "writes": []})
             reads = set(info.get("reads", []))
-
+            
             if not reads:
                 continue
-
+                
+            # 找出写入这些变量的函数作为前置函数
             for other_func in all_functions:
                 if other_func == func:
                     continue
-
-                other_info = self.ast_rw_info.get(other_func, {})
+                    
+                other_info = self.ast_rw_info.get(other_func, {"reads": [], "writes": []})
                 writes = set(other_info.get("writes", []))
-
+                
+                # 如果 other_func 写入了 func 读取的变量
                 if writes & reads:
-                    graph[func].add(other_func)
-                    print(f"[DEP] {func} 依赖 {other_func}，交集变量: {writes & reads}")  # ← 加这里
-
-        self._dependency_graph = dict(graph)
-        print(f"[DEP] 完整依赖图: {dict(graph)}")  # ← 加这里
-        return self._dependency_graph
+                    self.dependency_graph[func].add(other_func)
+                    
+        return dict(self.dependency_graph)
     
     def get_prerequisite_chain(self, target_func: str, max_depth: int = 10) -> List[str]:
         """
@@ -137,20 +132,23 @@ class SequenceGenerator:
             
         visited = set()
         chain = []
-
-        def dfs(func, depth):
+        
+        def dfs(func: str, depth: int):
             if depth > max_depth or func in visited:
                 return
             visited.add(func)
-
-            prerequisites = dep_graph.get(func, set())
-            print(f"[DFS] func={func}, prerequisites={prerequisites}")  # ← 加这里
+            
+            # 先递归处理前置函数
+            prerequisites = self.dependency_graph.get(func, set())
             for prereq in prerequisites:
-                if prereq in self.ast_rw_info:
-                    dfs(prereq, depth + 1)
-
+                dfs(prereq, depth + 1)
+                
+            # 然后添加当前函数
             if func not in chain:
                 chain.append(func)
+                
+        dfs(target_func, 0)
+        return chain
     
     def sort_functions_by_priority(self, functions: List[str]) -> List[str]:
         """

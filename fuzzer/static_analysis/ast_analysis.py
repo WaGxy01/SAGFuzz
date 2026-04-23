@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
-from eth_utils import keccak
+from web3 import Web3
 
 
 def analyze_ast(ast):
@@ -51,7 +51,7 @@ def analyze_ast(ast):
 
                     # 构建函数签名
                     signature = f"{func_name}({','.join(param_types)})"
-                    selector = '0x' + keccak(text=signature)[:4].hex().replace('0x', '')
+                    selector = '0x' + Web3.sha3(text=signature)[:4].hex().replace('0x', '')
 
                     # 分析读写
                     reads = set()
@@ -289,68 +289,10 @@ def analyze_expression(node, state_variables, reads):
                     if isinstance(item, dict):
                         analyze_expression(item, state_variables, reads)
 
-def extract_prerequisite_writes(sequences: dict, ast_rw_info: dict) -> dict:
-    """
-    从调用链中提取前置函数（最后一个之前的所有函数）的 write 信息，
-    输出格式与 path.py 一致：{"0x函数签名": {"read": set(), "write": {变量名集合}}}
-
-    Args:
-        sequences:    invocation_sequence 生成的调用链
-                      格式: {"0x目标函数": ["0xfunc1", "0xfunc2", ..., "0x目标函数"]}
-        ast_rw_info:  analyze_ast() 的输出
-                      格式: {"0x函数签名": {"reads": [...], "writes": [...]}}
-
-    Returns:
-        {"0x函数签名": {"read": set(), "write": set(变量名)}}
-    """
-    result = {}
-
-    for target_func, seq in sequences.items():
-        if len(seq) <= 1:
-            # 只有目标函数本身，没有前置函数
-            continue
-
-        # 最后一个是目标函数，取前面所有的
-        prerequisites = seq[:-1]
-
-        for func_sig in prerequisites:
-            if func_sig in result:
-                continue  # 已经处理过，跳过重复
-            rw = ast_rw_info.get(func_sig, {})
-            writes = set(rw.get("writes", []))
-            result[func_sig] = {
-                "read": set(),
-                "write": writes
-            }
-
-    return result
-
-
-def get_variable_slot_mapping(ast):
-    """
-    从 AST 提取状态变量名到 slot 编号的映射
-    按声明顺序分配 slot（简单类型每个占一个 slot）
-
-    Returns:
-        {"变量名": slot编号}
-    """
-    mapping = {}
-
-    for node in ast.get('nodes', []):
-        if node.get('nodeType') == 'ContractDefinition':
-            slot = 0
-            for item in node.get('nodes', []):
-                if item.get('nodeType') == 'VariableDeclaration' and item.get('stateVariable'):
-                    var_name = item.get('name')
-                    mapping[var_name] = slot
-                    slot += 1
-
-    return mapping
-
 
 if __name__ == '__main__':
     # 测试用：从文件读取 AST
-    with open('C:/Users/15028/Desktop/论文/论文配套智能合约remix/output/FancyBank_ast.json', 'r') as f:
+    with open('C:/Users/15028/Desktop/论文/论文配套智能合约remix/output/Depfuzz.sol_json.ast', 'r') as f:
         ast = json.load(f)
 
     result = analyze_ast(ast)

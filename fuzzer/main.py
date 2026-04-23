@@ -78,8 +78,6 @@ class Fuzzer:
                                       source_file=source_file,
                                       )
 
-
-
     def run(self):
         contract_address = None
         self.instrumented_evm.create_fake_accounts()
@@ -165,8 +163,6 @@ class Fuzzer:
         engine = EvolutionaryFuzzingEngine(population=population, selection=selection, crossover=crossover, mutation=mutation, mapping=get_function_signature_mapping(self.env.abi))
         engine.fitness_register(lambda x: fitness_function(x, self.env))
         engine.analysis.append(ExecutionTraceAnalyzer(self.env))
-
-
 
         self.env.execution_begin = time.time()
         self.env.population = population
