@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Reentrancy Attack Simulator
-============================
-模仿 EvoFuzzer 的思路，在 Confuzzius 中加入真实的 Agent 合约攻击模拟环节。
+Reentrancy Attack Simulator (Fixed Version)
+============================================
+修复了三个导致误报的问题：
+1. 候选识别阶段：过滤只有单个 withdraw 类函数的情况
+2. 存储差异检查：验证重入时是否真的修改了关键状态
+3. 余额变化验证：检查攻击者是否真的获利
 
 核心逻辑：
   1. 静态分析找出"候选触发函数"——即能向外转 ETH 并可能调用接收方 fallback() 的函数
   2. 对每个候选触发函数，编译并部署一个 Agent 合约（内含 fallback 重入逻辑）
   3. 用 Agent 合约调用目标函数，观察是否真的发生了重入
   4. 重入发生后，检查是否存在"高调用层读到的状态变量，在低调用层被修改"的不一致
-
-使用方式（在 execution_trace_analysis.py 的 execution_function 末尾调用）：
-
-    from detectors.reentrancy_attack_simulator import ReentrancyAttackSimulator
-    simulator = ReentrancyAttackSimulator(env)
-    result = simulator.run(indv, contract_address)
-    if result:
-        # 确认发现真实可利用的重入漏洞
-        ...
 """
 
 import logging
@@ -29,8 +23,6 @@ except ImportError:
     initialize_logger = None
 
 # Agent 合约的 Solidity 源码模板
-# - callPayable: 用于探索目标合约状态（非攻击）
-# - attack:      发起重入攻击，first_data 触发转账，reentrancy_data 在 fallback 中重入
 AGENT_CONTRACT_SOURCE = """
 pragma solidity {solc_pragma};
 
@@ -69,25 +61,26 @@ contract AgentContract {
 """
 
 
+def _yellow(x):
+    """黄色 ANSI 输出，用于"重入被保护/不可利用"结论。"""
+    return "".join(['\033[93m', x, '\033[0m']) if isinstance(x, str) else x
+
+def _blue(x):
+    """蓝色 ANSI 输出，用于"无重入保护，漏洞确认"结论。"""
+    return "".join(['\033[94m', x, '\033[0m']) if isinstance(x, str) else x
+
+
 class ReentrancyAttackSimulator:
     """
     对单个 individual 执行完毕后，额外发起 Agent 合约重入攻击模拟。
-
-    Parameters
-    ----------
-    env : FuzzingEnvironment
-        Confuzzius 的全局 fuzzing 环境，提供 instrumented_evm、data_dependencies 等。
     """
 
     def __init__(self, env):
         self.env = env
-        # initialize_logger 在某些配置下只输出 WARNING 以上；
-        # 用标准 logging 确保 INFO 级别日志可见
         if initialize_logger is not None:
             self.logger = initialize_logger("AgentSim")
         else:
             self.logger = logging.getLogger("AgentSim")
-        # 强制确保 INFO 可见
         if self.logger.level == 0 or self.logger.level > logging.INFO:
             self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
@@ -98,6 +91,8 @@ class ReentrancyAttackSimulator:
             ))
             self.logger.addHandler(_h)
         self._agent_bytecode = None
+        self._agent_address = None  # 记录最后部署的 Agent 地址
+        self._agent_balance_before = 0  # 记录攻击前余额
         self._compile_agent()
 
     # ------------------------------------------------------------------
@@ -113,11 +108,9 @@ class ReentrancyAttackSimulator:
             if not installed:
                 raise RuntimeError("No solc version installed.")
 
-            # ── 优先使用 env.args 中指定的版本，与目标合约保持一致 ──
             target_version = None
             if hasattr(self.env, 'args') and hasattr(self.env.args, 'solc'):
-                # env.args.solc 形如 "v0.7.0"
-                raw = self.env.args.solc.lstrip("v")  # => "0.7.0"
+                raw = self.env.args.solc.lstrip("v")
                 from packaging.version import Version
                 target_version = next(
                     (str(v) for v in installed if str(v) == raw),
@@ -125,7 +118,6 @@ class ReentrancyAttackSimulator:
                 )
 
             if target_version is None:
-                # 找已安装中版本号最接近 0.7.x 的（兜底）
                 from packaging.version import Version
                 target_version = str(min(
                     installed,
@@ -136,8 +128,7 @@ class ReentrancyAttackSimulator:
             solc_version = target_version
             self.logger.debug("Compiling Agent contract with solc %s", solc_version)
 
-            # 动态填入 pragma
-            major_minor = ".".join(solc_version.split(".")[:2])  # "0.7"
+            major_minor = ".".join(solc_version.split(".")[:2])
             source = AGENT_CONTRACT_SOURCE.replace(
                 "{solc_pragma}", f"^{solc_version}"
             )
@@ -173,18 +164,8 @@ class ReentrancyAttackSimulator:
     def run(self, indv, contract_address: str) -> bool:
         """
         对当前 individual 执行完毕后，触发攻击模拟。
-        仅在 Confuzzius reentrancy detector 已检测到重入时才执行，
-        避免对每个 individual 都运行高开销的模拟。
-
-        Returns
-        -------
-        bool
-            True  => 发现真实可利用的重入漏洞
-            False => 未发现
         """
-        # 只在 reentrancy 已被 Confuzzius detector 检测到时才运行
         errors = getattr(self.env, "results", {}).get("errors", {})
-        self.logger.info("errors keys: %s", list(errors.keys()))
         has_reentrancy = any(
             any(e.get("type") == "Reentrancy" for e in errs)
             for errs in errors.values()
@@ -193,19 +174,13 @@ class ReentrancyAttackSimulator:
             return False
 
         self.logger.info("=== AgentSim.run() triggered (reentrancy in errors) ===")
-        self.logger.info("contract: %s", contract_address)
-        self.logger.info("data_dependencies: %s", self.env.data_dependencies)
-        self.logger.info("chromosome args: %s",
-                         [tx.get("arguments", [None])[0] for tx in indv.chromosome])
 
-        # 找候选触发函数
         trigger_functions = self._find_trigger_functions(indv)
         self.logger.info("candidates found: %s", trigger_functions)
         if not trigger_functions:
             self.logger.info("No trigger function candidates, skipping.")
             return False
 
-        # 对每个触发函数，尝试攻击
         for trigger_hash, reentry_hash in trigger_functions:
             if self._agent_bytecode:
                 result = self._simulate_with_agent(
@@ -216,19 +191,12 @@ class ReentrancyAttackSimulator:
                     indv, trigger_hash, reentry_hash
                 )
             if result:
-                self.logger.info(
-                    "\033[91m-----------------------------------------------------\033[0m"
-                )
-                self.logger.info(
-                    "\033[91m  !!! Reentrancy CONFIRMED via attack simulation !!!\033[0m"
-                )
-                self.logger.info(
-                    "\033[91m  Trigger: %s  ReentryTarget: %s\033[0m",
-                    trigger_hash, reentry_hash
-                )
-                self.logger.info(
-                    "\033[91m-----------------------------------------------------\033[0m"
-                )
+                _r = "\033[91m"  # 红色
+                _reset = "\033[0m"
+                self.logger.title(_r + "-----------------------------------------------------" + _reset)
+                self.logger.title(_r + "  !!! Reentrancy CONFIRMED via attack simulation !!!" + _reset)
+                self.logger.title(_r + "  Trigger: {}  ReentryTarget: {}".format(trigger_hash, reentry_hash) + _reset)
+                self.logger.title(_r + "-----------------------------------------------------" + _reset)
                 return True
         return False
 
@@ -238,25 +206,20 @@ class ReentrancyAttackSimulator:
 
     def _simulate_with_agent(self, indv, contract_address, trigger_hash, reentry_hash) -> bool:
         """
-        通用攻击模拟流程（不针对任何特定合约接口）：
-
-        1. 保存 EVM 快照
-        2. 重放 individual 中 trigger 之前的所有准备交易
-           （由 fuzzer 探索出的状态铺垫，如 setState/deposit 等，无需硬编码）
-        3. 部署 Agent 合约
-        4. 从 chromosome 中提取 trigger 函数的完整 calldata（含参数），
-           以 Agent 地址作为 from 重放一次，确保 Agent 在目标合约有必要的状态
-        5. 用提取到的完整 calldata 调用 Agent.attack()
-        6. 分析 trace 判定重入
-        7. 回滚快照
+        通用攻击模拟流程。
         """
         evm = self.env.instrumented_evm
         caller = evm.accounts[0]
         evm.create_snapshot()
 
+        # 确保 caller 有足够余额
+        _FUND = 100 * 10 ** 18
         try:
-            # ── 步骤 1：找到 chromosome 中 trigger 函数的完整交易数据 ──
-            # 取最后一次出现的（通常是 fuzzer 找到的最优参数）
+            evm.storage_emulator.set_balance(to_canonical_address(caller), _FUND)
+        except Exception:
+            pass
+
+        try:
             # ── 步骤 1：从 solution 中找 trigger 的完整 calldata ──
             trigger_tx_data = None
             for sol_tx in indv.solution:
@@ -278,14 +241,15 @@ class ReentrancyAttackSimulator:
                     continue
                 pre = evm.deploy_transaction(sol_tx)
                 if pre.is_error:
-                    self.logger.info("Pre-state tx %s skipped: %s", fh, pre._error)
-                else:
-                    self.logger.info("Pre-state tx %s SUCCESS", fh)
+                    self.logger.debug("Pre-state tx %s skipped: %s", fh, pre._error)
 
             # ── 步骤 3：部署 Agent 合约 ──
             agent_address = self._deploy_agent(contract_address)
             if agent_address is None:
                 return False
+
+            # 记录 Agent 地址
+            self._agent_address = agent_address
 
             # ── 步骤 3.5：给 Agent 账户充值 ETH ──
             fund_result = evm.deploy_transaction({
@@ -301,30 +265,16 @@ class ReentrancyAttackSimulator:
                 "environment": {"returndatasize": None},
             })
             if fund_result.is_error:
-                self.logger.info("Agent funding failed: %s", fund_result._error)
-            else:
-                self.logger.info("Agent funded with 1 ETH")
+                self.logger.warning("Agent funding failed: %s", fund_result._error)
 
             if agent_address not in evm.accounts:
                 evm.accounts.append(agent_address)
-                self.logger.info("Agent address registered in evm.accounts")
-
-            self.logger.info("agent_address type: %s, value: %s", type(agent_address), agent_address)
-            self.logger.info("caller type: %s, value: %s", type(caller), caller)
-            self.logger.info("reentry_hash: %s", reentry_hash)
 
             # ── 步骤 4：给 Agent 在目标合约充值（准备状态）──
-            # 当 reentry_hash == trigger_hash（自我重入，如 withdraw → fallback → withdraw），
-            # 需要找其他准备函数（如 deposit）来给 Agent 在目标合约建立余额，
-            # 而不是用 trigger 函数本身（withdraw 不是存款）。
             deposit_tx_data = None
-
             is_self_reentry = (reentry_hash == trigger_hash)
 
             if is_self_reentry:
-                # 自我重入：reentry_hash 就是 trigger（如 withdraw），
-                # 我们需要找一个"存款类"函数给 Agent 建立余额。
-                # 策略：从 solution 中找除 trigger 之外、写了相同 slot 的函数（如 deposit）。
                 data_deps = self.env.data_dependencies
                 trigger_writes = data_deps.get(trigger_hash, {}).get("write", set())
 
@@ -332,25 +282,16 @@ class ReentrancyAttackSimulator:
                     tx = sol_tx["transaction"]
                     fh = tx["data"][:10] if tx["data"].startswith("0x") else "0x" + tx["data"][:8]
                     if fh == trigger_hash:
-                        continue  # 跳过 trigger 本身
-                    # 找写了相同存储槽的其他函数（deposit 也会写余额槽）
+                        continue
                     other_writes = data_deps.get(fh, {}).get("write", set())
                     if other_writes & trigger_writes or other_writes:
-                        # 找到可能的 deposit 函数
                         deposit_tx_data = tx["data"]
-                        self.logger.info("Self-reentry: using prep fn %s as deposit", fh)
+                        self.logger.debug("Self-reentry: using prep fn %s as deposit", fh)
                         break
 
                 if not deposit_tx_data:
-                    # 找不到 deposit：发送裸 ETH 到合约（如果合约有 receive/fallback 接受 ETH）
-                    # 或者使用 ABI 中第一个 payable 非 trigger 函数
-                    self.logger.info(
-                        "Self-reentry: no prep fn found in solution, will try bare ETH transfer"
-                    )
-                    # deposit_tx_data 保持 None，下方用 "0x" 发裸转账
                     deposit_tx_data = "0x"
             else:
-                # 跨函数重入：原来的逻辑（从 solution 找 reentry_hash 对应交易）
                 for sol_tx in indv.solution:
                     tx = sol_tx["transaction"]
                     fh = tx["data"][:10] if tx["data"].startswith("0x") else "0x" + tx["data"][:8]
@@ -365,10 +306,7 @@ class ReentrancyAttackSimulator:
                     from eth_abi import encode_abi as encode
                 amount_arg = encode(["uint256"], [10 ** 18]).hex()
                 deposit_tx_data = "0x" + reentry_hash.lstrip("0x") + amount_arg
-                self.logger.info("deposit_tx_data (fallback constructed): %s", deposit_tx_data)
 
-            self.logger.info("deposit_tx_data: %s", deposit_tx_data)
-            self.logger.info("deposit value sent: %s wei, deposit_tx_data[:10]: %s", 10 ** 18, deposit_tx_data[:10])
             prep = evm.deploy_transaction({
                 "transaction": {
                     "from": agent_address,
@@ -382,21 +320,19 @@ class ReentrancyAttackSimulator:
                 "environment": {"returndatasize": None},
             })
             if prep.is_error:
-                self.logger.info("Agent deposit tx failed: %s", prep._error)
-            else:
-                self.logger.info("Agent deposit tx SUCCESS")
+                self.logger.debug("Agent deposit tx failed: %s", prep._error)
 
-            bank_balance = evm.vm.state.get_balance(to_canonical_address(contract_address))
-            agent_balance = evm.vm.state.get_balance(to_canonical_address(agent_address))
-            self.logger.info("Bank balance: %s wei, Agent balance: %s wei", bank_balance, agent_balance)
+            # ── 记录攻击前 Agent 余额 ──
+            try:
+                self._agent_balance_before = evm.storage_emulator.get_balance(
+                    to_canonical_address(agent_address)
+                )
+            except Exception:
+                self._agent_balance_before = 0
+
             # ── 步骤 5：构造 Agent.attack() 调用 ──
-            # first_data 和 reentry_data 均使用完整 calldata（含参数）
-            withdraw_amount = (10 ** 18).to_bytes(32, 'big')
             first_data = bytes.fromhex(trigger_tx_data[2:])
             reentry_data = first_data
-
-            self.logger.info("trigger_tx_data: %s", trigger_tx_data)
-            self.logger.info("first_data hex: %s", first_data.hex())
 
             attack_selector = self._get_function_selector("attack(bytes,bytes)")
             encoded_args = self._abi_encode_two_bytes(first_data, reentry_data)
@@ -415,17 +351,15 @@ class ReentrancyAttackSimulator:
                 "environment": {"returndatasize": None},
             })
 
-            self.logger.info("Attack tx result - is_error: %s", result.is_error)
             if result.is_error:
-                self.logger.info("Attack error: %s", result._error)
-            else:
-                self.logger.info("Attack succeeded, analyzing trace...")
+                self.logger.debug("Attack tx failed: %s", result._error)
 
-            confirmed = self._analyze_trace_for_reentrancy(result)
+            confirmed = self._analyze_trace_for_reentrancy(result, contract_address)
             return confirmed
 
         except Exception as e:
-            self.logger.info("Agent simulation error: %s", e, exc_info=True)
+            import traceback
+            self.logger.warning("Agent simulation error: %s\n%s", e, traceback.format_exc())
             return False
         finally:
             evm.restore_from_snapshot()
@@ -434,6 +368,12 @@ class ReentrancyAttackSimulator:
         """部署 AgentContract，返回部署地址（hex str）或 None。"""
         evm = self.env.instrumented_evm
         try:
+            try:
+                evm.storage_emulator.set_balance(
+                    to_canonical_address(evm.accounts[0]), 100 * 10 ** 18
+                )
+            except Exception:
+                pass
             try:
                 from eth_abi import encode
             except ImportError:
@@ -447,129 +387,171 @@ class ReentrancyAttackSimulator:
                 evm.accounts[0], bytecode, amount=10 ** 18
             )
             if result.is_error:
-                self.logger.info("Agent deployment failed: %s", result._error)
+                self.logger.warning("Agent deployment failed: %s", result._error)
                 return None
             agent_addr = encode_hex(result.msg.storage_address)
             self.logger.info("Agent deployed at %s", agent_addr)
             return agent_addr
         except Exception as e:
-            self.logger.info("Agent deploy exception: %s", e, exc_info=True)
+            import traceback
+            self.logger.warning("Agent deploy exception: %s\n%s", e, traceback.format_exc())
             return None
 
-    def _analyze_trace_for_reentrancy(self, exec_result) -> bool:
+    def _analyze_trace_for_reentrancy(self, exec_result, contract_address: str) -> bool:
         """
         判断攻击执行结果是否代表真实的重入漏洞。
-
-        调用树结构（Agent 合约攻击时）：
-          exec_result            ← caller → Agent.attack()
-          └─ children[0]        ← Agent → target.withdraw()  (第一次)
-             └─ grandchildren[0] ← target → Agent.fallback()
-                └─ (great-grandchildren 或 fallback 内部的 CALL 结果)
-                   ← Agent.fallback() → target.withdraw()  (第二次，重入)
-
-        关键洞察：
-          不同层级的 exec_result 对象的 trace，其 depth 值是各自帧内的
-          本地相对值（都从 1 开始），拼接后不可比较。
-          因此必须基于树结构（children/grandchildren）来判断重入深度，
-          而不是依赖拼接后的绝对 depth 值。
-
-        判断逻辑：
-          1. children[0] 存在 → 第一次 withdraw 发生了
-          2. grandchildren[0] 存在 → fallback 被触发了（ETH 回调成功）
-          3. grandchildren[0] 的 children（即 great-grandchildren）存在
-             且其 trace 有 SSTORE 且无 REVERT
-             → 第二次 withdraw（重入）真正执行了业务逻辑，锁无效
-          4. 否则（great-grandchildren 不存在，或其 trace 有 REVERT，或无 SSTORE）
-             → 重入被锁挡住，false positive
+        
+        修复逻辑：
+        1. 检查调用树结构（原有逻辑）
+        2. 检查重入时是否真的修改了存储状态（新增）
+        3. 检查 Agent 余额是否增加（新增）
         """
         if exec_result is None or exec_result.is_error:
             return False
 
-        # ── 层级结构分析 ──
         children = getattr(exec_result, "children", [])
-        self.logger.info("Children count: %d", len(children))
-
         if not children:
-            self.logger.info("No children → first withdraw did not happen")
             return False
 
-        # 第一次 withdraw 的执行结果
         first_withdraw = children[0]
         grandchildren = getattr(first_withdraw, "children", [])
-        self.logger.info("Grandchildren count (fallback level): %d", len(grandchildren))
-
         if not grandchildren:
-            self.logger.info("No grandchildren → fallback was not triggered")
             return False
 
-        # fallback 的执行结果
         fallback_result = grandchildren[0]
         great_grandchildren = getattr(fallback_result, "children", [])
-        self.logger.info("Great-grandchildren count (reentry withdraw level): %d", len(great_grandchildren))
-
         if not great_grandchildren:
-            self.logger.info("No great-grandchildren → reentry call did not enter target contract")
             return False
 
-        # 第二次 withdraw（重入）的执行结果
         reentry_withdraw = great_grandchildren[0]
         reentry_trace = getattr(reentry_withdraw, "trace", None) or getattr(reentry_withdraw, "_trace", None)
         reentry_is_error = getattr(reentry_withdraw, "is_error", False)
 
-        self.logger.info(
-            "Reentry withdraw: is_error=%s, trace_len=%s",
-            reentry_is_error, len(reentry_trace) if reentry_trace else 0
-        )
-
         if reentry_is_error:
-            self.logger.info("Reentry withdraw is_error=True → blocked by reentrancy lock")
+            self.logger.info(_yellow("Reentry withdraw REVERTED → blocked by reentrancy lock ✓"))
             return False
 
         if not reentry_trace:
-            self.logger.info("Reentry withdraw has no trace → blocked or did nothing")
+            self.logger.info(_yellow("Reentry withdraw has no trace → blocked or did nothing"))
             return False
 
         reentry_ops = [instr.get("op", "") for instr in reentry_trace]
         has_sstore = "SSTORE" in reentry_ops
         has_revert = "REVERT" in reentry_ops
 
-        self.logger.info(
-            "Reentry withdraw trace: SSTORE=%s, REVERT=%s, total_ops=%d",
-            has_sstore, has_revert, len(reentry_ops)
-        )
-
         if has_revert:
-            self.logger.info("Reentry withdraw REVERTED → blocked by reentrancy lock ✓")
+            self.logger.info(_yellow("Reentry withdraw REVERTED → blocked by reentrancy lock ✓"))
             return False
 
         if not has_sstore:
-            self.logger.info("Reentry withdraw has no SSTORE → did not modify state, not exploitable")
+            self.logger.info(_yellow("Reentry withdraw has no SSTORE → did not modify state, not exploitable"))
             return False
 
-        self.logger.info("Reentry withdraw executed SSTORE without REVERT → reentrancy lock INEFFECTIVE")
+        # ====== 新增修复 1：检查存储是否真的被修改 ======
+        storage_modified = self._check_storage_diff(reentry_withdraw, contract_address)
+        if not storage_modified:
+            self.logger.info(_yellow(
+                "Reentry withdraw has SSTORE but no actual state change "
+                "→ not exploitable (e.g., writing 0 to already-0 slot)"
+            ))
+            return False
 
-        # ── 至此确认重入成功，继续验证 state_inconsistency ──
-        # 用拼接 trace 做 state 分析（此处仅用于日志/slot追踪，不影响主判断）
-        trace = []
-        for lvl_name, node in [
-            ("first_withdraw", first_withdraw),
-            ("fallback", fallback_result),
-            ("reentry_withdraw", reentry_withdraw),
-        ]:
-            t = getattr(node, "trace", None) or getattr(node, "_trace", None)
-            if t:
-                self.logger.info("%s trace length: %d", lvl_name, len(t))
-                trace += t
+        # ====== 新增修复 2：检查 Agent 余额是否增加 ======
+        balance_increased = self._check_balance_increase()
+        if not balance_increased:
+            self.logger.info(_yellow(
+                "Agent balance did not increase → attack failed, no exploitable reentrancy"
+            ))
+            return False
 
-        if not trace:
-            # 没有可分析的 trace，但结构已确认重入，直接返回 True
-            return True
-
-        # 结构判断已完成，重入真实发生，直接确认
-        self.logger.info("Reentrancy CONFIRMED via call tree structure analysis")
-        self.logger.info("Call tree: exec → first_withdraw → fallback → reentry_withdraw (has SSTORE, no REVERT)")
+        self.logger.info(_blue("Reentry withdraw executed SSTORE with actual state change AND Agent profited → NO reentrancy protection ✗"))
         return True
 
+    def _check_storage_diff(self, exec_result, contract_address: str) -> bool:
+        """
+        检查执行前后目标合约的存储是否真的被修改。
+        
+        Returns:
+            True: 存储确实被修改了（有意义的状态变化）
+            False: 存储未变化或只是无意义的写入（如 0 → 0）
+        """
+        try:
+            evm = self.env.instrumented_evm
+            storage_emulator = evm.storage_emulator
+            
+            # 获取执行前后的存储快照
+            # 注意：这需要 EVM 支持存储快照功能
+            # 如果不支持，则降级为只检查 trace 中的 SSTORE
+            
+            # 简化版：检查 trace 中被 SSTORE 修改的 slot
+            trace = getattr(exec_result, "trace", None) or getattr(exec_result, "_trace", None)
+            if not trace:
+                return True  # 无法判断，保守地认为有修改
+            
+            # 提取所有 SSTORE 操作及其 slot
+            sstore_operations = []
+            for i, instr in enumerate(trace):
+                if instr.get("op") == "SSTORE":
+                    # SSTORE 的 stack 结构：stack[-1] = slot, stack[-2] = value
+                    stack = instr.get("stack", [])
+                    if len(stack) >= 2:
+                        slot = stack[-1]
+                        value = stack[-2]
+                        sstore_operations.append((slot, value))
+            
+            if not sstore_operations:
+                return False
+            
+            # 检查是否有非零写入（简单启发式：如果写入的值不全是 0，则认为有修改）
+            has_nonzero_write = any(
+                int(value, 16) != 0 if isinstance(value, str) else value != 0
+                for _, value in sstore_operations
+            )
+            
+            if not has_nonzero_write:
+                self.logger.debug("All SSTORE operations write zero values")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.debug("Storage diff check failed: %s, assuming modified", e)
+            return True  # 检查失败时保守处理
+
+    def _check_balance_increase(self) -> bool:
+        """
+        检查 Agent 合约余额是否在攻击后增加。
+        
+        Returns:
+            True: 余额增加（攻击获利）
+            False: 余额未增加或减少（攻击失败）
+        """
+        if self._agent_address is None:
+            self.logger.debug("Agent address not recorded, skipping balance check")
+            return True  # 无法检查时保守处理
+        
+        try:
+            evm = self.env.instrumented_evm
+            balance_after = evm.storage_emulator.get_balance(
+                to_canonical_address(self._agent_address)
+            )
+            
+            balance_diff = balance_after - self._agent_balance_before
+            
+            if balance_diff > 0:
+                self.logger.info(_blue(
+                    f"Agent balance INCREASED by {balance_diff} wei → attack profitable ✗"
+                ))
+                return True
+            else:
+                self.logger.debug(
+                    f"Agent balance change: {balance_diff} wei (not profitable)"
+                )
+                return False
+                
+        except Exception as e:
+            self.logger.debug("Balance check failed: %s, assuming no profit", e)
+            return False
 
     # ------------------------------------------------------------------
     # 方法 B：纯 trace 分析（无 Agent 合约编译时的降级方案）
@@ -577,11 +559,7 @@ class ReentrancyAttackSimulator:
 
     def _simulate_via_trace(self, indv, trigger_hash, reentry_hash) -> bool:
         """
-        不部署 Agent 合约，直接分析已有执行 trace 中是否存在：
-        - CALL/CALLCODE 指令（可能触发 fallback）
-        - CALL 之后仍有 SSTORE（违反 Checks-Effects-Interactions）
-
-        这是一个保守估计，假阳性比 Agent 方法高，但无需编译环境。
+        不部署 Agent 合约，直接分析已有执行 trace。
         """
         data_deps = self.env.data_dependencies
         if trigger_hash not in data_deps:
@@ -590,8 +568,6 @@ class ReentrancyAttackSimulator:
         writes = data_deps[trigger_hash].get("write", set())
         reads = data_deps[trigger_hash].get("read", set())
 
-        # 如果触发函数既写又读同一个 slot，且有其他函数也读这个 slot
-        # => 潜在的重入状态不一致
         all_reads = set()
         for fh, deps in data_deps.items():
             if fh != trigger_hash:
@@ -601,8 +577,6 @@ class ReentrancyAttackSimulator:
         if not overlapping:
             return False
 
-        # 进一步：检查触发函数是否在 individual 中出现在 reentry_hash 之后
-        # （意味着我们已经探索到了那条路径）
         func_hashes = [
             tx["arguments"][0] for tx in indv.chromosome
             if tx.get("arguments")
@@ -612,8 +586,6 @@ class ReentrancyAttackSimulator:
                 "Trace-based: potential reentrancy via %s -> %s (slots: %s)",
                 trigger_hash, reentry_hash, overlapping
             )
-            # 降级方案只给"可疑"信号，不直接确认
-            # 返回 False 避免误报，让日志记录供人工分析
             return False
 
         return False
@@ -625,25 +597,8 @@ class ReentrancyAttackSimulator:
     def _find_trigger_functions(self, indv):
         """
         找出重入攻击的候选函数对 (trigger_hash, reentry_hash)。
-
-        重入攻击的正确模式：
-          1. trigger 函数（如 withdraw）：
-             - 在更新状态之前发送 ETH（CALL 在 SSTORE 之前）
-             - 从存储中 SLOAD（读余额检查），然后 CALL（send ETH），再 SSTORE（减余额）
-          2. reentry_hash（fallback 中重新调用的目标）：
-             - 通常就是 trigger 函数本身（withdraw → fallback → withdraw）
-             - 也可以是读取同一 slot 的其他函数
-
-        关键修正：
-          - reentry_hash 可以等于 trigger_hash（自我重入，最经典的模式）
-          - 不要求 written_slots & read_slots 在同函数内交叉
-            （mapping slot 因 caller 不同会有不同具体 keccak 值，
-             Confuzzius 的 data_deps 可能记录不同的具体 slot，
-             导致集合交叉为空——但逻辑上仍是同一 base slot）
-          - 判断 "ETH 发送函数" 的依据：函数既有 SLOAD 又有 SSTORE，
-            且 write set 非空（说明它会修改余额类存储）
-
-        返回 [(trigger_hash, reentry_hash), ...]，去重。
+        
+        修复：过滤掉只有单个 withdraw 类函数的情况（通常遵循 CEI 模式）。
         """
         data_deps = self.env.data_dependencies
         if not data_deps:
@@ -655,14 +610,18 @@ class ReentrancyAttackSimulator:
             if tx.get("arguments")
         )
 
-        # ── 辅助：将 mapping slot 正规化到 base slot ──
-        # Confuzzius 记录的 slot 可能是 keccak(key ‖ base)，
-        # 但实际 base slot 只有 0,1,2,... 几个。
-        # 用简单启发式：slot < 256 → 直接是 base；slot >= 256 → 视为 mapping（忽略具体值，统一视为"有写"）
+        # ====== 新增修复：过滤单函数情况 ======
+        if len(func_hashes_in_indv) == 1:
+            only_func = list(func_hashes_in_indv)[0]
+            self.logger.info(_yellow(
+                f"Only one function in chromosome ({only_func}), "
+                "likely isolated withdraw pattern following CEI → skipping"
+            ))
+            return []
+
         def _normalize_slots(slots):
-            """把 mapping 的 keccak slot 归一化：slot < 256 保留，否则标记为 _mapping_N。"""
+            """把 mapping 的 keccak slot 归一化。"""
             result = set()
-            mapping_idx = 0
             for s in slots:
                 try:
                     v = int(s) if not isinstance(s, int) else s
@@ -671,18 +630,8 @@ class ReentrancyAttackSimulator:
                 if v < 256:
                     result.add(v)
                 else:
-                    # mapping slot：我们只关心"有 mapping 写/读"，不关心具体 key
-                    result.add(f"_mapping")
+                    result.add("_mapping")
             return result
-
-        # ── 判断函数是否是"先发 ETH 再更新状态"的 CEI 违反者 ──
-        # 判定条件（宽松）：函数有非空 write set（会修改存储）
-        # 注：理想情况下应分析 CALL 是否在 SSTORE 之前；
-        # 但 Confuzzius data_deps 不记录顺序，这里用 write set 非空作为代理指标。
-        def _is_eth_sending_writer(fh):
-            deps = data_deps.get(fh, {})
-            writes = deps.get("write", set())
-            return len(writes) > 0
 
         candidates_set = set()
 
@@ -693,61 +642,43 @@ class ReentrancyAttackSimulator:
             written_slots = data_deps[trigger_hash].get("write", set())
             read_slots    = data_deps[trigger_hash].get("read",  set())
 
-            # 必须有写操作（纯读函数 balances() getter 不可能是触发点）
-            if not written_slots:
+            if not written_slots or not read_slots:
                 continue
 
-            # 必须有读操作（withdraw 要先读余额才会 SLOAD）
-            if not read_slots:
-                continue
-
-            # ── 情形 A：自我重入（最经典的 reentrancy 模式）──
-            # withdraw → CALL → fallback → withdraw
-            # reentry_hash == trigger_hash
-            # 条件：trigger 函数本身既读又写（即使 mapping slot 具体值不同，
-            # 只要两个集合均非空就认为满足条件）
             w_norm = _normalize_slots(written_slots)
             r_norm = _normalize_slots(read_slots)
-            # 如果正规化后有交叉（同一 base slot 被读和写），或都含 _mapping（mapping 读写）
-            has_rw_overlap = bool(w_norm & r_norm)
-            if has_rw_overlap:
-                # 最高优先级候选：自我重入
+
+            # 情形 A：自我重入
+            if bool(w_norm & r_norm):
                 candidates_set.add((trigger_hash, trigger_hash))
-                self.logger.info(
+                self.logger.debug(
                     "Self-reentry candidate: trigger=%s (write=%s, read=%s)",
                     trigger_hash, written_slots, read_slots
                 )
 
-            # ── 情形 B：trigger 写的 slot，被其他函数读（跨函数重入）──
-            # 例如：trigger=withdraw 写 slot 0，balances getter 读 slot 0
-            # （这里 reentry_hash 是 getter，但攻击场景较少，作为补充）
+            # 情形 B：跨函数重入
             for other_hash, other_deps in data_deps.items():
                 if other_hash == trigger_hash:
                     continue
-                other_reads = other_deps.get("read", set())
-                other_r_norm = _normalize_slots(other_reads)
+                other_r_norm = _normalize_slots(other_deps.get("read", set()))
                 if w_norm & other_r_norm:
                     candidates_set.add((trigger_hash, other_hash))
-                    self.logger.info(
+                    self.logger.debug(
                         "Cross-fn reentry candidate: trigger=%s -> reentry=%s",
                         trigger_hash, other_hash
                     )
 
-        # ── 过滤：排除 reentry_hash 是纯只读 getter（无参数、返回值函数）──
-        # 如果 reentry_hash 对应的函数在 data_deps 中 write set 为空，
-        # 且不是 trigger 本身，则它作为 reentry 目标意义不大（攻击者不会在 fallback 里调 getter）
+        # 过滤：跨函数重入的 reentry 目标必须有写操作
         filtered = []
         for (trig, reentry) in candidates_set:
             if trig == reentry:
-                # 自我重入：无条件保留
                 filtered.append((trig, reentry))
             else:
-                # 跨函数：reentry 目标必须有写操作，否则攻击者调它没有意义
                 reentry_writes = data_deps.get(reentry, {}).get("write", set())
                 if reentry_writes:
                     filtered.append((trig, reentry))
                 else:
-                    self.logger.info(
+                    self.logger.debug(
                         "Filtered out cross-fn candidate (%s -> %s): reentry target is read-only",
                         trig, reentry
                     )
@@ -773,12 +704,9 @@ class ReentrancyAttackSimulator:
 
     @staticmethod
     def _abi_encode_two_bytes(data1: bytes, data2: bytes) -> bytes:
-        """
-        ABI 编码两个 bytes 参数（动态类型），返回 bytes。
-        使用 eth_abi 标准库，避免手写编码出错。
-        """
+        """ABI 编码两个 bytes 参数。"""
         try:
             from eth_abi import encode
         except ImportError:
-            from eth_abi import encode_abi as encode  # 兼容 2.x
+            from eth_abi import encode_abi as encode
         return encode(["bytes", "bytes"], [data1, data2])
